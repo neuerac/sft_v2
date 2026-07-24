@@ -1,0 +1,10 @@
+# Core scanning, review-preview, and playback-gain dependencies.
+numpy
+soundfile
+pyloudnorm
+scipy
+tqdm
+
+# GPU alignment stack. Install in the Linux training environment.
+faster-whisper
+whisperx
