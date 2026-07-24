@@ -3,10 +3,10 @@
 The input is the canonical JSONL emitted by ``build_alignment_manifest.py``.
 It deliberately does not synthesize tempo or gain variants: every output row
 points at the original recording and carries enough provenance to audit the
-pseudo-label later. Speed tiers are based on the alignment manifest's
-``pause_excluded_cps``: it subtracts only confirmed long, VAD-inactive gaps
-between adjacent aligned characters without treating all low-energy speech as
-a pause.
+pseudo-label later. The legacy speed path uses the alignment manifest's
+``pause_excluded_cps``. A strict speed-only profile is also available for
+pilot training: it uses full-audio VAD articulation CPS and rejects CTC
+alignments, pauses, and non-speech annotations that make a rate label unsafe.
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ try:  # Supports both ``python -m Script.control_pipeline...`` and direct use.
         is_speed_excluded,
         iter_jsonl,
         resolve_audio,
+        strip_emotion_tags,
         write_jsonl,
     )
 except ImportError:  # pragma: no cover - exercised when run as a script.
@@ -51,11 +52,12 @@ except ImportError:  # pragma: no cover - exercised when run as a script.
         is_speed_excluded,
         iter_jsonl,
         resolve_audio,
+        strip_emotion_tags,
         write_jsonl,
     )
 
 
-VERSION = "natural_speed_effort_candidates_v3"
+VERSION = "natural_speed_effort_candidates_v4"
 SUCCESS_STATUSES = frozenset({"ok", "success", "aligned", "complete", "completed"})
 CONTROL_TAG_RE = re.compile(
     r"【(?:speed|effort|volume)(?:_[^】]*)?】|【loud】", re.IGNORECASE
@@ -82,6 +84,17 @@ FIELD_ALIASES = {
     "speech_start": ("speech_start_sec", "aligned_start_sec", "first_speech_sec"),
     "speech_end": ("speech_end_sec", "aligned_end_sec", "last_speech_sec"),
     "speech_span": ("speech_span_sec", "aligned_span_sec", "speech_duration_sec"),
+    "audio_duration": ("audio_duration_sec", "duration_sec", "duration"),
+    "global_vad_active_duration": (
+        "vad_active_duration_sec",
+        "active_speech_duration_sec",
+        "active_duration_sec",
+        "active_duration_sec_est",
+    ),
+    "speech_vad_active_duration": (
+        "speech_vad_active_duration_sec",
+        "aligned_vad_active_duration_sec",
+    ),
     "active_duration": (
         "speech_vad_active_duration_sec",
         "vad_active_duration_sec",
@@ -178,6 +191,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional root for relative audio values in the input manifest.",
     )
+    parser.add_argument(
+        "--emit-controls",
+        choices=("both", "speed", "effort"),
+        default="both",
+        help="Write both control families by default; use speed for a speed-only pilot.",
+    )
 
     parser.add_argument(
         "--speed-tier-strategy",
@@ -241,6 +260,113 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Permit old manifests missing pause_excluded_cps to use full-span speech_cps. "
             "Never falls back to articulation_cps."
+        ),
+    )
+    parser.add_argument(
+        "--speed-clean-profile",
+        action="store_true",
+        help=(
+            "Enable strict speed-only quality gates and default to full-audio "
+            "VAD articulation CPS. This is recommended for a first speed pilot."
+        ),
+    )
+    parser.add_argument(
+        "--speed-rate-metric",
+        choices=("pause_excluded_cps", "speech_span_cps", "full_audio_vad_cps"),
+        default=None,
+        help=(
+            "Metric used to calibrate and label speed. The clean profile defaults "
+            "to full_audio_vad_cps, which excludes silent gaps over the complete audio."
+        ),
+    )
+    parser.add_argument(
+        "--min-speed-spoken-units",
+        type=int,
+        default=None,
+        help="Optional speed-only minimum lexical-unit count; clean profile defaults to 20.",
+    )
+    parser.add_argument(
+        "--max-speed-spoken-units",
+        type=int,
+        default=None,
+        help="Optional speed-only maximum lexical-unit count; clean profile defaults to 80.",
+    )
+    parser.add_argument(
+        "--max-speed-breath-events",
+        type=int,
+        default=None,
+        help="Optional maximum [breath] markers; clean profile defaults to 2.",
+    )
+    parser.add_argument(
+        "--max-speed-hold-events",
+        type=int,
+        default=None,
+        help="Optional maximum [hold] markers; clean profile defaults to 0.",
+    )
+    parser.add_argument(
+        "--min-speed-ctc-score",
+        type=float,
+        default=None,
+        help="Optional per-character CTC confidence cutoff; clean profile defaults to 0.50.",
+    )
+    parser.add_argument(
+        "--max-speed-low-ctc-score-ratio",
+        type=float,
+        default=None,
+        help="Optional maximum fraction below --min-speed-ctc-score; clean profile defaults to 0.10.",
+    )
+    parser.add_argument(
+        "--min-speed-character-duration-sec",
+        type=float,
+        default=None,
+        help="Optional short-character cutoff; clean profile defaults to 0.035 seconds.",
+    )
+    parser.add_argument(
+        "--max-speed-short-character-ratio",
+        type=float,
+        default=None,
+        help="Optional maximum short-character fraction; clean profile defaults to 0.10.",
+    )
+    parser.add_argument(
+        "--min-speed-vad-alignment-coverage",
+        type=float,
+        default=None,
+        help=(
+            "Optional minimum fraction of full-audio VAD speech covered by the CTC "
+            "speech interval; clean profile defaults to 0.85."
+        ),
+    )
+    parser.add_argument(
+        "--max-speed-long-gap-ratio",
+        type=float,
+        default=None,
+        help=(
+            "Optional maximum CTC inter-character-gap share; clean profile defaults "
+            "to 0.15 for gaps of at least 0.30 seconds."
+        ),
+    )
+    parser.add_argument(
+        "--speed-long-gap-min-sec",
+        type=float,
+        default=0.30,
+        help="Gap duration used by --max-speed-long-gap-ratio (default: 0.30).",
+    )
+    parser.add_argument(
+        "--speed-slow-proxy-emotions",
+        default="",
+        help=(
+            "Comma-separated single-emotion prefixes to deliberately proxy as "
+            "speed_slow, for example reserved1,reserved2. Proxy rows are excluded "
+            "from rate calibration and their matching emotion tags are removed from "
+            "the model text."
+        ),
+    )
+    parser.add_argument(
+        "--speed-slow-proxy-allow-extra-events",
+        action="store_true",
+        help=(
+            "Let slow emotion-proxy rows bypass the breath/hold count gates. This is "
+            "an explicitly confounded diagnostic option, not a clean speed dataset."
         ),
     )
     parser.add_argument("--max-asr-cer", type=float, default=0.12)
@@ -382,7 +508,8 @@ def _record_id(record: dict[str, Any], source: str, manifest: str, line_number: 
         or ""
     ).strip()
     if raw_audio:
-        return f"{source}:audio:{raw_audio.replace('\\', '/')}"
+        normalized_audio = raw_audio.replace("\\", "/")
+        return f"{source}:audio:{normalized_audio}"
     return f"{source}:{manifest}:{line_number}"
 
 
@@ -412,6 +539,102 @@ def _timestamp_entries(record: dict[str, Any]) -> list[tuple[float, float]]:
         if start is not None and end is not None and 0 <= start <= end:
             output.append((start, end))
     return output
+
+
+def _timestamp_quality_metrics(
+    record: dict[str, Any],
+    timestamps: list[tuple[float, float]],
+    score_cutoff: float,
+    short_duration_sec: float,
+    long_gap_min_sec: float,
+) -> dict[str, Any]:
+    """Summarise CTC timestamp health without trusting count coverage alone."""
+    values = _lookup(
+        record,
+        (
+            "character_timestamps",
+            "word_timestamps",
+            "alignment_timestamps",
+            "aligned_timestamps",
+        ),
+    )
+    scores: list[float] = []
+    short_count = 0
+    if isinstance(values, list):
+        for value in values:
+            if not isinstance(value, dict):
+                continue
+            start = finite_float(value.get("start_sec", value.get("start", value.get("begin"))))
+            end = finite_float(value.get("end_sec", value.get("end", value.get("stop"))))
+            if start is None or end is None or end < start:
+                continue
+            if end - start < short_duration_sec:
+                short_count += 1
+            score = finite_float(value.get("score"))
+            if score is not None:
+                scores.append(score)
+
+    long_gaps: list[float] = []
+    for (_, previous_end), (next_start, _) in zip(timestamps, timestamps[1:]):
+        gap = next_start - previous_end
+        if gap >= long_gap_min_sec:
+            long_gaps.append(gap)
+
+    count = len(timestamps)
+    span = timestamps[-1][1] - timestamps[0][0] if count >= 2 else 0.0
+    return {
+        "ctc_scores_available": len(scores) == count and count > 0,
+        "ctc_score_p50": _quantile(scores, 0.50) if scores else None,
+        "ctc_low_score_count": sum(score < score_cutoff for score in scores),
+        "ctc_low_score_ratio": (sum(score < score_cutoff for score in scores) / len(scores)) if scores else None,
+        "short_character_count": short_count,
+        "short_character_ratio": short_count / count if count else None,
+        "long_gap_count": len(long_gaps),
+        "long_gap_duration_sec": sum(long_gaps),
+        "long_gap_ratio": sum(long_gaps) / span if span > 0 else None,
+    }
+
+
+def _event_count(text: Any, event: str) -> int:
+    return sum(
+        value.strip().lower() == event
+        for value in re.findall(r"\[([^\]]+)\]", str(text or ""))
+    )
+
+
+def _parse_tag_prefixes(value: str) -> tuple[str, ...]:
+    return tuple(part.strip().lower() for part in str(value or "").split(",") if part.strip())
+
+
+def _matches_slow_proxy(text: Any, prefixes: tuple[str, ...]) -> tuple[bool, tuple[str, ...]]:
+    tags = tuple(emotion_tags(text))
+    if not prefixes or len(tags) != 1:
+        return False, tags
+    return any(tags[0] == prefix or tags[0].startswith(prefix) for prefix in prefixes), tags
+
+
+def _resolve_speed_profile(args: argparse.Namespace) -> None:
+    """Fill strict speed-pilot defaults without changing legacy invocations."""
+    if args.speed_rate_metric is None:
+        args.speed_rate_metric = "full_audio_vad_cps" if args.speed_clean_profile else "pause_excluded_cps"
+    args.speed_slow_proxy_prefixes = _parse_tag_prefixes(args.speed_slow_proxy_emotions)
+    if not args.speed_clean_profile:
+        return
+    defaults: dict[str, Any] = {
+        "min_speed_spoken_units": 20,
+        "max_speed_spoken_units": 80,
+        "max_speed_breath_events": 2,
+        "max_speed_hold_events": 0,
+        "min_speed_ctc_score": 0.50,
+        "max_speed_low_ctc_score_ratio": 0.10,
+        "min_speed_character_duration_sec": 0.035,
+        "max_speed_short_character_ratio": 0.10,
+        "min_speed_vad_alignment_coverage": 0.85,
+        "max_speed_long_gap_ratio": 0.15,
+    }
+    for name, value in defaults.items():
+        if getattr(args, name) is None:
+            setattr(args, name, value)
 
 
 def _status_is_successful(record: dict[str, Any]) -> bool:
@@ -479,7 +702,10 @@ def _style_rejection(record: dict[str, Any], args: argparse.Namespace) -> str | 
 
 
 def _speed_eligibility_rejection(
-    record: dict[str, Any], alignment: dict[str, Any], args: argparse.Namespace
+    record: dict[str, Any],
+    alignment: dict[str, Any],
+    args: argparse.Namespace,
+    is_slow_proxy: bool = False,
 ) -> str | None:
     """Return the speed-specific gate that does not apply to effort metrics."""
     clean_text = clean_spoken_text(record.get("clean_text") or record.get("text"))
@@ -487,6 +713,49 @@ def _speed_eligibility_rejection(
         return "non_cjk_speed_control"
     if alignment["alignment_coverage"] < args.min_speed_alignment_coverage:
         return "speed_alignment_coverage_below_threshold"
+
+    units = int(alignment["spoken_units"])
+    if args.min_speed_spoken_units is not None and units < args.min_speed_spoken_units:
+        return "speed_too_few_spoken_units"
+    if args.max_speed_spoken_units is not None and units > args.max_speed_spoken_units:
+        return "speed_too_many_spoken_units"
+
+    quality = alignment["timestamp_quality"]
+    if args.min_speed_ctc_score is not None:
+        if not quality["ctc_scores_available"]:
+            return "speed_missing_ctc_scores"
+        if quality["ctc_low_score_ratio"] > args.max_speed_low_ctc_score_ratio:
+            return "speed_ctc_low_score_ratio_too_high"
+    if (
+        args.max_speed_short_character_ratio is not None
+        and quality["short_character_ratio"] is not None
+        and quality["short_character_ratio"] > args.max_speed_short_character_ratio
+    ):
+        return "speed_short_character_ratio_too_high"
+    if (
+        args.max_speed_long_gap_ratio is not None
+        and quality["long_gap_ratio"] is not None
+        and quality["long_gap_ratio"] > args.max_speed_long_gap_ratio
+    ):
+        return "speed_long_gap_ratio_too_high"
+    if args.min_speed_vad_alignment_coverage is not None:
+        coverage = alignment["alignment_vad_coverage"]
+        if coverage is None:
+            return "speed_missing_full_audio_vad_coverage"
+        if coverage < args.min_speed_vad_alignment_coverage:
+            return "speed_vad_alignment_coverage_too_low"
+
+    if not (is_slow_proxy and args.speed_slow_proxy_allow_extra_events):
+        text = str(record.get("text") or "")
+        breath_count = _event_count(text, "breath")
+        hold_count = _event_count(text, "hold")
+        if (
+            args.max_speed_breath_events is not None
+            and breath_count > args.max_speed_breath_events
+        ):
+            return "speed_too_many_breath_events"
+        if args.max_speed_hold_events is not None and hold_count > args.max_speed_hold_events:
+            return "speed_too_many_hold_events"
     return None
 
 
@@ -515,6 +784,17 @@ def _alignment_metrics(record: dict[str, Any], args: argparse.Namespace) -> tupl
     timestamps = _timestamp_entries(record)
     if not timestamps:
         return None, "missing_character_timestamps"
+    timestamp_quality = _timestamp_quality_metrics(
+        record,
+        timestamps,
+        args.min_speed_ctc_score if args.min_speed_ctc_score is not None else 0.50,
+        (
+            args.min_speed_character_duration_sec
+            if args.min_speed_character_duration_sec is not None
+            else 0.035
+        ),
+        args.speed_long_gap_min_sec,
+    )
     start = _number(record, "speech_start")
     end = _number(record, "speech_end")
     if start is None:
@@ -530,7 +810,9 @@ def _alignment_metrics(record: dict[str, Any], args: argparse.Namespace) -> tupl
     if not args.min_speech_span_sec <= span <= args.max_speech_span_sec:
         return None, "speech_span_out_of_range"
 
-    active_duration = _number(record, "active_duration")
+    active_duration = _number(record, "speech_vad_active_duration")
+    if active_duration is None:
+        active_duration = _number(record, "active_duration")
     if active_duration is None or active_duration <= 0:
         return None, "missing_vad_active_duration"
     if active_duration > span * 1.05:
@@ -556,19 +838,49 @@ def _alignment_metrics(record: dict[str, Any], args: argparse.Namespace) -> tupl
         return None, "pause_ratio_too_high"
 
     pause_excluded_cps = _number(record, "pause_excluded_cps")
-    speed_rate_metric = "pause_excluded_cps"
+    pause_metric_name = "pause_excluded_cps"
     if pause_excluded_cps is None:
-        if not args.allow_legacy_speed_fallback:
+        if args.speed_rate_metric == "pause_excluded_cps" and not args.allow_legacy_speed_fallback:
             return None, "missing_pause_excluded_cps"
-        # Old manifests may only contain the full aligned-span rate. This is an
-        # explicit compatibility path; VAD articulation CPS is never a speed
-        # fallback because it changes the definition of the control label.
-        pause_excluded_cps = _number(record, "legacy_speech_cps")
-        if pause_excluded_cps is None:
-            pause_excluded_cps = units / span
-        speed_rate_metric = "speech_cps_legacy_fallback"
-    if pause_excluded_cps <= 0:
+        if args.allow_legacy_speed_fallback:
+            # Old manifests may only contain a full aligned-span rate. This is
+            # an explicit compatibility path for legacy speed mode only.
+            pause_excluded_cps = _number(record, "legacy_speech_cps")
+            if pause_excluded_cps is None:
+                pause_excluded_cps = units / span
+            pause_metric_name = "speech_cps_legacy_fallback"
+    if pause_excluded_cps is not None and pause_excluded_cps <= 0:
         return None, "invalid_pause_excluded_cps"
+
+    global_vad_active_duration = _number(record, "global_vad_active_duration")
+    if global_vad_active_duration is not None and global_vad_active_duration <= 0:
+        return None, "invalid_full_audio_vad_active_duration"
+    audio_duration = _number(record, "audio_duration")
+    if (
+        global_vad_active_duration is not None
+        and audio_duration is not None
+        and global_vad_active_duration > audio_duration * 1.05
+    ):
+        return None, "full_audio_vad_duration_exceeds_audio"
+
+    speech_span_cps = units / span
+    full_audio_vad_cps = (
+        units / global_vad_active_duration if global_vad_active_duration is not None else None
+    )
+    speed_rates = {
+        "pause_excluded_cps": pause_excluded_cps,
+        "speech_span_cps": speech_span_cps,
+        "full_audio_vad_cps": full_audio_vad_cps,
+    }
+    speed_rate_cps = speed_rates[args.speed_rate_metric]
+    if speed_rate_cps is None:
+        return None, f"missing_{args.speed_rate_metric}"
+    speed_rate_metric = pause_metric_name if args.speed_rate_metric == "pause_excluded_cps" else args.speed_rate_metric
+    alignment_vad_coverage = (
+        active_duration / global_vad_active_duration
+        if global_vad_active_duration is not None
+        else None
+    )
 
     return {
         "asr_cer": cer,
@@ -579,16 +891,21 @@ def _alignment_metrics(record: dict[str, Any], args: argparse.Namespace) -> tupl
         "speech_end_sec": end,
         "speech_span_sec": span,
         "vad_active_duration_sec": active_duration,
+        "full_audio_vad_active_duration_sec": global_vad_active_duration,
+        "audio_duration_sec": audio_duration,
+        "alignment_vad_coverage": alignment_vad_coverage,
         "vad_active_ratio": active_ratio,
         "pause_ratio": pause_ratio,
-        "speech_cps": units / span,
+        "speech_cps": speech_span_cps,
         "articulation_cps": units / active_duration,
-        "pause_excluded_cps": _number(record, "pause_excluded_cps"),
+        "full_audio_vad_cps": full_audio_vad_cps,
+        "pause_excluded_cps": pause_excluded_cps,
         "pause_excluded_duration_sec": _number(record, "pause_excluded_duration"),
         "char_pause_count": _number(record, "char_pause_count"),
         "char_pause_duration_sec": _number(record, "char_pause_duration"),
         "char_pause_ratio": _number(record, "char_pause_ratio"),
-        "speed_rate_cps": pause_excluded_cps,
+        "timestamp_quality": timestamp_quality,
+        "speed_rate_cps": speed_rate_cps,
         "speed_rate_metric": speed_rate_metric,
     }, None
 
@@ -756,7 +1073,8 @@ def _candidate_record(
     result.pop("audio_codes", None)
     if item["audio"]:
         result["audio"] = item["audio"]
-    result["text"] = add_control_tags(item["original_text"], tag)
+    model_text = str(item.get("model_text") or item["original_text"])
+    result["text"] = add_control_tags(model_text, tag)
     result["source"] = item["source"]
     result["recording_group"] = item["recording_group"]
     result["control_candidate_id"] = f"{item['record_id']}::{control_kind}"
@@ -764,7 +1082,11 @@ def _candidate_record(
     result["control_data_role"] = "control"
     result["control_kind"] = control_kind
     result["control_tag"] = tag
-    result["control_label_source"] = "natural_pause_excluded_speed_and_within_group_effort_v3"
+    result["control_label_source"] = (
+        "reserved_emotion_proxy_speed_v1"
+        if control_kind == "speed" and item.get("slow_proxy")
+        else "natural_speed_and_within_group_effort_v4"
+    )
     result["requires_human_review"] = control_kind == "effort"
     result["speed_label"] = item["speed_label"]
     result["effort_label"] = item["effort_label"]
@@ -779,6 +1101,10 @@ def _candidate_record(
         "record_id": item["record_id"],
         "recording_group": item["recording_group"],
         "original_text": item["original_text"],
+        "model_text_before_control_tag": model_text,
+        "speed_label_source": item.get("speed_label_source", "rate_quantile"),
+        "slow_emotion_proxy": bool(item.get("slow_proxy")),
+        "removed_model_emotion_tags": list(item.get("removed_model_emotion_tags", ())),
         "emotion_tags": emotion_tags(item["original_text"]),
         "emotion_family": emotion_family(item["original_text"]),
         "stratum": {
@@ -870,10 +1196,65 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-paralinguistic-ratio must be within [0, 1]")
     if args.min_speech_span_sec <= 0 or args.max_speech_span_sec <= args.min_speech_span_sec:
         raise ValueError("speech span limits are invalid")
+    if args.min_speed_spoken_units is not None and args.min_speed_spoken_units < 1:
+        raise ValueError("--min-speed-spoken-units must be >= 1")
+    if (
+        args.max_speed_spoken_units is not None
+        and args.max_speed_spoken_units < 1
+    ):
+        raise ValueError("--max-speed-spoken-units must be >= 1")
+    if (
+        args.min_speed_spoken_units is not None
+        and args.max_speed_spoken_units is not None
+        and args.max_speed_spoken_units < args.min_speed_spoken_units
+    ):
+        raise ValueError("speed spoken-unit limits are invalid")
+    for name in ("max_speed_breath_events", "max_speed_hold_events"):
+        value = getattr(args, name)
+        if value is not None and value < 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be >= 0")
+    paired = (args.min_speed_ctc_score, args.max_speed_low_ctc_score_ratio)
+    if (paired[0] is None) != (paired[1] is None):
+        raise ValueError(
+            "--min-speed-ctc-score and --max-speed-low-ctc-score-ratio must be set together"
+        )
+    if paired[0] is not None and not 0 <= paired[0] <= 1:
+        raise ValueError("--min-speed-ctc-score must be within [0, 1]")
+    if paired[1] is not None and not 0 <= paired[1] <= 1:
+        raise ValueError("--max-speed-low-ctc-score-ratio must be within [0, 1]")
+    if (
+        args.min_speed_character_duration_sec is not None
+        and args.min_speed_character_duration_sec <= 0
+    ):
+        raise ValueError("--min-speed-character-duration-sec must be positive")
+    if (
+        args.max_speed_short_character_ratio is not None
+        and not 0 <= args.max_speed_short_character_ratio <= 1
+    ):
+        raise ValueError("--max-speed-short-character-ratio must be within [0, 1]")
+    if (
+        args.min_speed_vad_alignment_coverage is not None
+        and not 0 <= args.min_speed_vad_alignment_coverage <= 1
+    ):
+        raise ValueError("--min-speed-vad-alignment-coverage must be within [0, 1]")
+    if (
+        args.max_speed_long_gap_ratio is not None
+        and not 0 <= args.max_speed_long_gap_ratio <= 1
+    ):
+        raise ValueError("--max-speed-long-gap-ratio must be within [0, 1]")
+    if args.speed_long_gap_min_sec <= 0:
+        raise ValueError("--speed-long-gap-min-sec must be positive")
+    if args.speed_slow_proxy_allow_extra_events and not args.speed_slow_proxy_prefixes:
+        raise ValueError(
+            "--speed-slow-proxy-allow-extra-events requires --speed-slow-proxy-emotions"
+        )
+    if args.emit_controls == "speed" and args.require_normal_effort_for_speed:
+        raise ValueError("--require-normal-effort-for-speed cannot be used with --emit-controls speed")
 
 
 def main() -> None:
     args = parse_args()
+    _resolve_speed_profile(args)
     _validate_args(args)
 
     total_input = 0
@@ -931,29 +1312,44 @@ def main() -> None:
                 "alignment": alignment,
                 "effort": None,
                 "speed_label": None,
+                "speed_label_source": "rate_quantile",
                 "effort_label": None,
                 "speed_eligibility_rejection": None,
             }
+            slow_proxy, source_emotions = _matches_slow_proxy(
+                item["original_text"], args.speed_slow_proxy_prefixes
+            )
+            item["slow_proxy"] = slow_proxy
+            item["source_emotions"] = source_emotions
+            item["removed_model_emotion_tags"] = source_emotions if slow_proxy else ()
+            item["model_text"] = (
+                strip_emotion_tags(item["original_text"], source_emotions)
+                if slow_proxy
+                else item["original_text"]
+            )
             # A partial CTC alignment can still provide useful acoustic data
             # for effort auditing, but its pause-excluded rate is not reliable
             # enough to calibrate or deconfound a speed label. Keep the two
             # gates separate so the general coverage threshold remains useful
             # for effort metric diagnostics.
-            speed_eligibility_rejection = _speed_eligibility_rejection(record, alignment, args)
+            speed_eligibility_rejection = _speed_eligibility_rejection(
+                record, alignment, args, slow_proxy
+            )
             if speed_eligibility_rejection is None:
                 speed_items.append(item)
             else:
                 item["speed_eligibility_rejection"] = speed_eligibility_rejection
                 rejections[speed_eligibility_rejection] += 1
-            effort, effort_reason = _effort_metrics(record, args)
-            if effort_reason:
-                rejections[effort_reason] += 1
-                continue
-            item["effort"] = effort
-            effort_items.append(item)
-            source_effort_metric_counts[source] += 1
+            if args.emit_controls != "speed":
+                effort, effort_reason = _effort_metrics(record, args)
+                if effort_reason:
+                    rejections[effort_reason] += 1
+                    continue
+                item["effort"] = effort
+                effort_items.append(item)
+                source_effort_metric_counts[source] += 1
 
-    speed_calibration = list(speed_items)
+    speed_calibration = [item for item in speed_items if not item["slow_proxy"]]
     if len(speed_calibration) < args.min_speed_calibration_records:
         raise ValueError(
             "not enough high-confidence rows for global speed calibration: "
@@ -991,7 +1387,12 @@ def main() -> None:
             }
         )
     for item in speed_items:
-        item["speed_label"] = _classify_speed(
+        if item["slow_proxy"]:
+            item["speed_label"] = "slow"
+            item["speed_label_source"] = "emotion_proxy"
+            continue
+
+        rate_label = _classify_speed(
             item["alignment"]["speed_rate_cps"],
             slow_boundary,
             fast_boundary,
@@ -999,19 +1400,35 @@ def main() -> None:
             normal_low_boundary,
             normal_high_boundary,
         )
+        has_proxy_emotion = any(
+            tag == prefix or tag.startswith(prefix)
+            for tag in item["source_emotions"]
+            for prefix in args.speed_slow_proxy_prefixes
+        )
+        if args.speed_slow_proxy_prefixes and (has_proxy_emotion or rate_label == "slow"):
+            # In proxy mode every emitted slow example must originate from the
+            # requested emotion, and mixed-emotion proxy rows are not silently
+            # repurposed as normal/fast controls.
+            item["speed_label"] = None
+            item["speed_label_source"] = "omitted_by_slow_proxy_policy"
+        else:
+            item["speed_label"] = rate_label
 
-    group_thresholds, group_rejections = _effort_thresholds(effort_items, args)
-    rejections.update({f"effort_{name}": count for name, count in group_rejections.items()})
-    for item in effort_items:
-        threshold = group_thresholds.get(item["recording_group"])
-        if threshold is None:
-            rejections["effort_group_without_threshold"] += 1
-            continue
-        label = _classify_effort(item, threshold)
-        if label is None:
-            rejections["effort_metric_disagreement_or_ambiguous"] += 1
-            continue
-        item["effort_label"] = label
+    group_thresholds: dict[str, dict[str, Any]] = {}
+    group_rejections: Counter[str] = Counter()
+    if args.emit_controls != "speed":
+        group_thresholds, group_rejections = _effort_thresholds(effort_items, args)
+        rejections.update({f"effort_{name}": count for name, count in group_rejections.items()})
+        for item in effort_items:
+            threshold = group_thresholds.get(item["recording_group"])
+            if threshold is None:
+                rejections["effort_group_without_threshold"] += 1
+                continue
+            label = _classify_effort(item, threshold)
+            if label is None:
+                rejections["effort_metric_disagreement_or_ambiguous"] += 1
+                continue
+            item["effort_label"] = label
 
     output_records: list[dict[str, Any]] = []
     output_counts: Counter[str] = Counter()
@@ -1026,24 +1443,25 @@ def main() -> None:
             item["line_number"],
         ),
     )
-    for item in ordered_speed_items:
-        if item["speed_label"] is None:
-            selection_rejections["speed_transition_band_excluded"] += 1
-            continue
-        if args.require_normal_effort_for_speed and item["effort_label"] != "normal":
-            selection_rejections["speed_requires_normal_effort"] += 1
-            continue
-        candidate = _candidate_record(
-            item,
-            "speed",
-            str(item["speed_label"]),
-            speed_boundaries,
-            group_thresholds.get(item["recording_group"]),
-            args,
-        )
-        output_records.append(candidate)
-        output_counts[f"speed_{item['speed_label']}"] += 1
-        source_output_counts[f"{item['source']}:speed_{item['speed_label']}"] += 1
+    if args.emit_controls != "effort":
+        for item in ordered_speed_items:
+            if item["speed_label"] is None:
+                selection_rejections["speed_transition_band_excluded"] += 1
+                continue
+            if args.require_normal_effort_for_speed and item["effort_label"] != "normal":
+                selection_rejections["speed_requires_normal_effort"] += 1
+                continue
+            candidate = _candidate_record(
+                item,
+                "speed",
+                str(item["speed_label"]),
+                speed_boundaries,
+                group_thresholds.get(item["recording_group"]),
+                args,
+            )
+            output_records.append(candidate)
+            output_counts[f"speed_{item['speed_label']}"] += 1
+            source_output_counts[f"{item['source']}:speed_{item['speed_label']}"] += 1
 
     ordered_effort_items = sorted(
         effort_items,
@@ -1054,24 +1472,25 @@ def main() -> None:
             item["line_number"],
         ),
     )
-    for item in ordered_effort_items:
-        if item["effort_label"] is None:
-            continue
-        threshold = group_thresholds[item["recording_group"]]
-        if item["speed_label"] == "normal":
-            candidate = _candidate_record(
-                item, "effort", str(item["effort_label"]), speed_boundaries, threshold, args
-            )
-            output_records.append(candidate)
-            output_counts[f"effort_{item['effort_label']}"] += 1
-            source_output_counts[f"{item['source']}:effort_{item['effort_label']}"] += 1
-        elif item["speed_label"] is None:
-            if item.get("speed_eligibility_rejection") is None:
-                selection_rejections["effort_speed_transition_band_excluded"] += 1
+    if args.emit_controls != "speed":
+        for item in ordered_effort_items:
+            if item["effort_label"] is None:
+                continue
+            threshold = group_thresholds[item["recording_group"]]
+            if item["speed_label"] == "normal":
+                candidate = _candidate_record(
+                    item, "effort", str(item["effort_label"]), speed_boundaries, threshold, args
+                )
+                output_records.append(candidate)
+                output_counts[f"effort_{item['effort_label']}"] += 1
+                source_output_counts[f"{item['source']}:effort_{item['effort_label']}"] += 1
+            elif item["speed_label"] is None:
+                if item.get("speed_eligibility_rejection") is None:
+                    selection_rejections["effort_speed_transition_band_excluded"] += 1
+                else:
+                    selection_rejections[_unavailable_speed_selection_reason(item, "effort")] += 1
             else:
-                selection_rejections[_unavailable_speed_selection_reason(item, "effort")] += 1
-        else:
-            selection_rejections["effort_requires_normal_speed"] += 1
+                selection_rejections["effort_requires_normal_speed"] += 1
 
     output_path = Path(args.output_jsonl)
     write_jsonl(output_path, output_records)
@@ -1084,6 +1503,7 @@ def main() -> None:
         str(item["alignment"]["speed_rate_metric"]) for item in speed_calibration
     )
     speed_calibration_sources = Counter(item["source"] for item in speed_calibration)
+    speed_proxy_items = [item for item in speed_items if item["slow_proxy"]]
     speed_quantiles = {
         "slow": args.speed_slow_quantile,
         "fast": args.speed_fast_quantile,
@@ -1112,6 +1532,11 @@ def main() -> None:
         "speed_candidate_policy": {
             "require_normal_effort": args.require_normal_effort_for_speed,
             "speed_candidates_before_optional_effort_filter": len(speed_items),
+            "clean_profile": args.speed_clean_profile,
+            "rate_metric": args.speed_rate_metric,
+            "slow_emotion_proxy_prefixes": list(args.speed_slow_proxy_prefixes),
+            "slow_emotion_proxy_candidates": len(speed_proxy_items),
+            "slow_emotion_proxy_allow_extra_events": args.speed_slow_proxy_allow_extra_events,
         },
         "output_records": len(output_records),
         "source_input_counts": dict(sorted(source_input_counts.items())),
@@ -1120,8 +1545,12 @@ def main() -> None:
         "rejections": dict(sorted(rejections.items())),
         "selection_rejections": dict(sorted(selection_rejections.items())),
         "speed_calibration": {
-            "scope": "global_all_high_confidence_speed_items",
-            "primary_metric": "pause_excluded_cps",
+            "scope": (
+                "global_high_confidence_speed_items_excluding_slow_emotion_proxy"
+                if args.speed_slow_proxy_prefixes
+                else "global_all_high_confidence_speed_items"
+            ),
+            "primary_metric": args.speed_rate_metric,
             "tier_strategy": args.speed_tier_strategy,
             "min_alignment_coverage": args.min_speed_alignment_coverage,
             "include_non_cjk_speed": args.include_non_cjk_speed,
@@ -1150,13 +1579,14 @@ def main() -> None:
         "invariants": {
             "speed_boundaries_shared_across_sources": True,
             "speed_boundaries_calibrated_from_all_high_confidence_sources": True,
-            "primary_speed_metric": "pause_excluded_cps",
+            "primary_speed_metric": args.speed_rate_metric,
             "speed_controls_require_min_alignment_coverage": args.min_speed_alignment_coverage,
             "non_cjk_speed_controls_enabled": args.include_non_cjk_speed,
             "legacy_speed_fallback_enabled": args.allow_legacy_speed_fallback,
             "speed_controls_require_effort_normal": args.require_normal_effort_for_speed,
             "speed_controls_are_independent_of_effort_by_default": not args.require_normal_effort_for_speed,
             "speed_transition_bands_excluded": args.speed_tier_strategy == "extreme-middle",
+            "speed_slow_proxy_is_emotion_confounded": bool(args.speed_slow_proxy_prefixes),
             "effort_controls_require_speed_normal": True,
             "natural_audio_only": True,
             "atempo_or_gain_records_excluded": True,
