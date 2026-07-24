@@ -369,6 +369,15 @@ def parse_args() -> argparse.Namespace:
             "an explicitly confounded diagnostic option, not a clean speed dataset."
         ),
     )
+    parser.add_argument(
+        "--allow-speed-paralinguistic",
+        action="store_true",
+        help=(
+            "Do not reject speed candidates for non-speech event annotations or "
+            "paralinguistic VAD ratio. Whisper, recitation, and panting remain "
+            "excluded because they are separate speaking styles."
+        ),
+    )
     parser.add_argument("--max-asr-cer", type=float, default=0.12)
     parser.add_argument("--min-alignment-coverage", type=float, default=0.90)
     parser.add_argument(
@@ -684,13 +693,16 @@ def _is_whisper(record: dict[str, Any]) -> bool:
 def _style_rejection(record: dict[str, Any], args: argparse.Namespace) -> str | None:
     if _is_whisper(record):
         return "whisper_style"
-    if is_speed_excluded(record):
-        return "speed_style_excluded"
     path = " ".join(
         str(record.get(field) or "") for field in ("audio", "audio_path", "audio_path_raw")
     ).lower()
     if "recitation" in path or "panting" in path or "朗诵" in path or "气喘" in path:
         return "speed_style_excluded"
+    allow_paralinguistic = bool(getattr(args, "allow_speed_paralinguistic", False))
+    if is_speed_excluded(record) and not allow_paralinguistic:
+        return "speed_style_excluded"
+    if allow_paralinguistic:
+        return None
     ratio = _number(record, "paralinguistic_ratio")
     if ratio is None:
         return "missing_paralinguistic_ratio"
@@ -1587,6 +1599,7 @@ def main() -> None:
             "speed_controls_are_independent_of_effort_by_default": not args.require_normal_effort_for_speed,
             "speed_transition_bands_excluded": args.speed_tier_strategy == "extreme-middle",
             "speed_slow_proxy_is_emotion_confounded": bool(args.speed_slow_proxy_prefixes),
+            "speed_paralinguistic_filter_disabled": args.allow_speed_paralinguistic,
             "effort_controls_require_speed_normal": True,
             "natural_audio_only": True,
             "atempo_or_gain_records_excluded": True,
