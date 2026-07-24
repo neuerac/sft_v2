@@ -15,6 +15,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from build_alignment_manifest import (  # noqa: E402
+    _is_cjk_only_clean_text,
     _input_ordinal_in_shard,
     _validate_shard_settings,
     parse_args,
@@ -36,6 +37,7 @@ class AlignmentShardingTest(unittest.TestCase):
         ):
             defaults = parse_args()
         self.assertEqual(defaults.language, "auto")
+        self.assertFalse(defaults.cjk_only)
         self.assertEqual((defaults.shard_count, defaults.shard_index), (1, 0))
 
         with patch.object(
@@ -53,6 +55,67 @@ class AlignmentShardingTest(unittest.TestCase):
         ):
             explicit = parse_args()
         self.assertEqual(explicit.language, "zh")
+
+    def test_cjk_only_text_predicate_and_cli_filter(self) -> None:
+        self.assertTrue(_is_cjk_only_clean_text("\u4f60\u597d\uff0c\u4e16\u754c\uff01"))
+        self.assertFalse(_is_cjk_only_clean_text("\u4f60\u597d hello"))
+        self.assertFalse(_is_cjk_only_clean_text("\u7b2c3\u7ae0"))
+        self.assertFalse(_is_cjk_only_clean_text("\uff01\uff1f"))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source.jsonl"
+            default_output = root / "default.jsonl"
+            cjk_output = root / "cjk-only.jsonl"
+            rows = [
+                {"key": "han", "text": "\u3010neutral\u3011\u4f60\u597d\uff0c\u4e16\u754c\uff01", "audio": "missing-han.wav"},
+                {"key": "mixed", "text": "\u4f60\u597d hello", "audio": "missing-mixed.wav"},
+                {"key": "number", "text": "\u7b2c3\u7ae0", "audio": "missing-number.wav"},
+                {"key": "punctuation", "text": "\uff01\uff1f", "audio": "missing-punctuation.wav"},
+            ]
+            source.write_text(
+                "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT_DIR / "build_alignment_manifest.py"),
+                    "--input-jsonl",
+                    str(source),
+                    "--output-jsonl",
+                    str(default_output),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT_DIR / "build_alignment_manifest.py"),
+                    "--input-jsonl",
+                    str(source),
+                    "--output-jsonl",
+                    str(cjk_output),
+                    "--cjk-only",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+            default_rows = [
+                json.loads(line) for line in default_output.read_text(encoding="utf-8").splitlines()
+            ]
+            cjk_rows = [
+                json.loads(line) for line in cjk_output.read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertEqual([row["key"] for row in default_rows], [row["key"] for row in rows])
+            self.assertEqual([row["key"] for row in cjk_rows], ["han"])
+            self.assertIn("cjk_only_skipped_records=3", result.stdout)
+            self.assertIn("selected_records=1", result.stdout)
 
     def test_stable_ordinal_sharding_and_argument_validation(self) -> None:
         selected = [

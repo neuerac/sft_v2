@@ -179,8 +179,54 @@ def parse_args() -> argparse.Namespace:
         help="Optional root for relative audio values in the input manifest.",
     )
 
-    parser.add_argument("--speed-slow-quantile", type=float, default=1.0 / 3.0)
-    parser.add_argument("--speed-fast-quantile", type=float, default=2.0 / 3.0)
+    parser.add_argument(
+        "--speed-tier-strategy",
+        choices=("contiguous", "extreme-middle"),
+        default="contiguous",
+        help=(
+            "contiguous keeps the legacy slow/normal/fast split. "
+            "extreme-middle keeps only the slow tail, the middle band, and "
+            "the fast tail; records in the two transition bands are omitted."
+        ),
+    )
+    parser.add_argument(
+        "--speed-slow-quantile",
+        type=float,
+        default=1.0 / 3.0,
+        help=(
+            "Legacy contiguous slow boundary. With --speed-tier-strategy "
+            "extreme-middle, this is the slow-tail upper quantile (for "
+            "example 0.20)."
+        ),
+    )
+    parser.add_argument(
+        "--speed-normal-low-quantile",
+        type=float,
+        default=0.40,
+        help=(
+            "Lower quantile of the retained normal band for "
+            "--speed-tier-strategy extreme-middle."
+        ),
+    )
+    parser.add_argument(
+        "--speed-normal-high-quantile",
+        type=float,
+        default=0.60,
+        help=(
+            "Upper quantile of the retained normal band for "
+            "--speed-tier-strategy extreme-middle."
+        ),
+    )
+    parser.add_argument(
+        "--speed-fast-quantile",
+        type=float,
+        default=2.0 / 3.0,
+        help=(
+            "Legacy contiguous fast boundary. With --speed-tier-strategy "
+            "extreme-middle, this is the fast-tail lower quantile (for "
+            "example 0.80)."
+        ),
+    )
     parser.add_argument("--min-speed-calibration-records", type=int, default=100)
     parser.add_argument(
         "--min-bb03-calibration-records",
@@ -636,6 +682,7 @@ def _effort_thresholds(
             continue
         thresholds[group] = {
             "eligible_records": len(group_items),
+            "tier_strategy": "extreme-middle",
             "quantile_levels": list(levels),
             "metrics": {name: [float(value) for value in values] for name, values in metric_thresholds.items()},
             "rms_soft_to_strong_span_db": rms_span,
@@ -659,11 +706,24 @@ def _classify_effort(item: dict[str, Any], threshold: dict[str, Any]) -> str | N
     return None
 
 
-def _classify_speed(cps: float, slow_boundary: float, fast_boundary: float) -> str:
+def _classify_speed(
+    cps: float,
+    slow_boundary: float,
+    fast_boundary: float,
+    strategy: str,
+    normal_low_boundary: float | None = None,
+    normal_high_boundary: float | None = None,
+) -> str | None:
     if cps <= slow_boundary:
         return "slow"
     if cps >= fast_boundary:
         return "fast"
+    if strategy == "extreme-middle":
+        if normal_low_boundary is None or normal_high_boundary is None:
+            raise ValueError("extreme-middle speed classification requires normal-band boundaries")
+        if normal_low_boundary <= cps <= normal_high_boundary:
+            return "normal"
+        return None
     return "normal"
 
 
@@ -730,6 +790,7 @@ def _candidate_record(
         },
         "speed_boundaries_cps": boundaries,
         "speed_metric": item["alignment"]["speed_rate_metric"],
+        "speed_tier_strategy": args.speed_tier_strategy,
         "effort_group_threshold": group_threshold,
         "confound_filter": (
             (
@@ -765,8 +826,21 @@ def _candidate_record(
 
 
 def _validate_args(args: argparse.Namespace) -> None:
-    if not 0 < args.speed_slow_quantile < args.speed_fast_quantile < 1:
-        raise ValueError("speed quantiles must satisfy 0 < slow < fast < 1")
+    if args.speed_tier_strategy == "contiguous":
+        if not 0 < args.speed_slow_quantile < args.speed_fast_quantile < 1:
+            raise ValueError("speed quantiles must satisfy 0 < slow < fast < 1")
+    elif not (
+        0
+        < args.speed_slow_quantile
+        < args.speed_normal_low_quantile
+        < args.speed_normal_high_quantile
+        < args.speed_fast_quantile
+        < 1
+    ):
+        raise ValueError(
+            "extreme-middle speed quantiles must satisfy "
+            "0 < slow-tail < normal-low < normal-high < fast-tail < 1"
+        )
     effort_levels = (
         args.effort_soft_quantile,
         args.effort_normal_low_quantile,
@@ -894,9 +968,36 @@ def main() -> None:
     if not slow_boundary < fast_boundary:
         raise ValueError("global speed calibration quantiles did not yield distinct boundaries")
     speed_boundaries = {"slow_max": slow_boundary, "fast_min": fast_boundary}
+    normal_low_boundary: float | None = None
+    normal_high_boundary: float | None = None
+    if args.speed_tier_strategy == "extreme-middle":
+        normal_low_boundary = _quantile(
+            (item["alignment"]["speed_rate_cps"] for item in speed_calibration),
+            args.speed_normal_low_quantile,
+        )
+        normal_high_boundary = _quantile(
+            (item["alignment"]["speed_rate_cps"] for item in speed_calibration),
+            args.speed_normal_high_quantile,
+        )
+        if not slow_boundary < normal_low_boundary < normal_high_boundary < fast_boundary:
+            raise ValueError(
+                "extreme-middle speed calibration quantiles did not yield four distinct boundaries; "
+                "use more diverse data or adjust the quantiles"
+            )
+        speed_boundaries.update(
+            {
+                "normal_min": normal_low_boundary,
+                "normal_max": normal_high_boundary,
+            }
+        )
     for item in speed_items:
         item["speed_label"] = _classify_speed(
-            item["alignment"]["speed_rate_cps"], slow_boundary, fast_boundary
+            item["alignment"]["speed_rate_cps"],
+            slow_boundary,
+            fast_boundary,
+            args.speed_tier_strategy,
+            normal_low_boundary,
+            normal_high_boundary,
         )
 
     group_thresholds, group_rejections = _effort_thresholds(effort_items, args)
@@ -926,6 +1027,9 @@ def main() -> None:
         ),
     )
     for item in ordered_speed_items:
+        if item["speed_label"] is None:
+            selection_rejections["speed_transition_band_excluded"] += 1
+            continue
         if args.require_normal_effort_for_speed and item["effort_label"] != "normal":
             selection_rejections["speed_requires_normal_effort"] += 1
             continue
@@ -962,7 +1066,10 @@ def main() -> None:
             output_counts[f"effort_{item['effort_label']}"] += 1
             source_output_counts[f"{item['source']}:effort_{item['effort_label']}"] += 1
         elif item["speed_label"] is None:
-            selection_rejections[_unavailable_speed_selection_reason(item, "effort")] += 1
+            if item.get("speed_eligibility_rejection") is None:
+                selection_rejections["effort_speed_transition_band_excluded"] += 1
+            else:
+                selection_rejections[_unavailable_speed_selection_reason(item, "effort")] += 1
         else:
             selection_rejections["effort_requires_normal_speed"] += 1
 
@@ -977,6 +1084,17 @@ def main() -> None:
         str(item["alignment"]["speed_rate_metric"]) for item in speed_calibration
     )
     speed_calibration_sources = Counter(item["source"] for item in speed_calibration)
+    speed_quantiles = {
+        "slow": args.speed_slow_quantile,
+        "fast": args.speed_fast_quantile,
+    }
+    if args.speed_tier_strategy == "extreme-middle":
+        speed_quantiles.update(
+            {
+                "normal_low": args.speed_normal_low_quantile,
+                "normal_high": args.speed_normal_high_quantile,
+            }
+        )
     effort_counts = Counter(
         f"{item['source']}:{item['effort_label']}"
         for item in effort_items
@@ -1004,15 +1122,13 @@ def main() -> None:
         "speed_calibration": {
             "scope": "global_all_high_confidence_speed_items",
             "primary_metric": "pause_excluded_cps",
+            "tier_strategy": args.speed_tier_strategy,
             "min_alignment_coverage": args.min_speed_alignment_coverage,
             "include_non_cjk_speed": args.include_non_cjk_speed,
             "metric_sources": dict(sorted(speed_metric_counts.items())),
             "source_counts": dict(sorted(speed_calibration_sources.items())),
             "records": len(speed_calibration),
-            "quantiles": {
-                "slow": args.speed_slow_quantile,
-                "fast": args.speed_fast_quantile,
-            },
+            "quantiles": speed_quantiles,
             "boundaries_cps": speed_boundaries,
             "speed_rate_cps": {
                 "min": min(item["alignment"]["speed_rate_cps"] for item in speed_calibration),
@@ -1027,6 +1143,7 @@ def main() -> None:
         "output_labels": dict(sorted(output_counts.items())),
         "output_labels_by_source": dict(sorted(source_output_counts.items())),
         "effort_groups_with_thresholds": len(group_thresholds),
+        "effort_tier_strategy": "extreme-middle",
         "effort_group_rejections": dict(sorted(group_rejections.items())),
         "effort_thresholds_by_group": group_thresholds,
         "parameters": vars(args),
@@ -1039,6 +1156,7 @@ def main() -> None:
             "legacy_speed_fallback_enabled": args.allow_legacy_speed_fallback,
             "speed_controls_require_effort_normal": args.require_normal_effort_for_speed,
             "speed_controls_are_independent_of_effort_by_default": not args.require_normal_effort_for_speed,
+            "speed_transition_bands_excluded": args.speed_tier_strategy == "extreme-middle",
             "effort_controls_require_speed_normal": True,
             "natural_audio_only": True,
             "atempo_or_gain_records_excluded": True,

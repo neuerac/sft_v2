@@ -364,6 +364,84 @@ class ControlPipelineTest(unittest.TestCase):
                 for row in strict_rows
             ))
 
+    def test_extreme_middle_speed_strategy_keeps_only_tails_and_center(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "alignment.jsonl"
+            candidates = root / "candidates.jsonl"
+            report = root / "candidates-report.json"
+            records: list[dict[str, object]] = []
+            for index, cps in enumerate(range(1, 11), start=1):
+                span = 6.0 / cps
+                records.append({
+                    "source": "bb03",
+                    "record_id": f"speed-{index}",
+                    "audio": f"/synthetic/speed-{index}.wav",
+                    "recording_group": "bb03:recording:test",
+                    "text": "\u3010neutral\u3011\u4e00\u4e8c\u4e09\u56db\u4e94\u516d",
+                    "clean_text": "\u4e00\u4e8c\u4e09\u56db\u4e94\u516d",
+                    "status": "ok",
+                    "alignment_status": "ok",
+                    "asr_cer": 0.01,
+                    "alignment_coverage": 1.0,
+                    "character_timestamps": [
+                        {
+                            "start_sec": 0.1 + (span * char_index / 6),
+                            "end_sec": 0.1 + (span * (char_index + 1) / 6),
+                        }
+                        for char_index in range(6)
+                    ],
+                    "speech_start_sec": 0.1,
+                    "speech_end_sec": 0.1 + span,
+                    "speech_span_sec": span,
+                    "pause_excluded_duration_sec": span,
+                    "pause_excluded_cps": cps,
+                    "char_pause_count": 0,
+                    "char_pause_duration_sec": 0.0,
+                    "char_pause_ratio": 0.0,
+                    "paralinguistic_ratio": 0.0,
+                    "speech_vad_active_duration_sec": span * 0.8,
+                    "pause_ratio": 0.2,
+                })
+            manifest.write_text(
+                "\n".join(json.dumps(record, ensure_ascii=False) for record in records) + "\n",
+                encoding="utf-8",
+            )
+
+            subprocess.run([
+                sys.executable, str(SCRIPT_DIR / "build_control_candidates.py"),
+                "--input-jsonl", str(manifest),
+                "--output-jsonl", str(candidates),
+                "--report-json", str(report),
+                "--min-speed-calibration-records", "10",
+                "--speed-tier-strategy", "extreme-middle",
+                "--speed-slow-quantile", "0.20",
+                "--speed-normal-low-quantile", "0.40",
+                "--speed-normal-high-quantile", "0.60",
+                "--speed-fast-quantile", "0.80",
+            ], check=True, capture_output=True, text=True)
+
+            rows = [json.loads(line) for line in candidates.read_text(encoding="utf-8").splitlines()]
+            labels_by_id = {
+                row["control_selection"]["record_id"]: row["control_tag"]
+                for row in rows
+            }
+            self.assertEqual(labels_by_id, {
+                "bb03:speed-1": "speed_slow",
+                "bb03:speed-2": "speed_slow",
+                "bb03:speed-5": "speed_normal",
+                "bb03:speed-6": "speed_normal",
+                "bb03:speed-9": "speed_fast",
+                "bb03:speed-10": "speed_fast",
+            })
+            stats = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual(stats["speed_calibration"]["tier_strategy"], "extreme-middle")
+            self.assertEqual(stats["selection_rejections"]["speed_transition_band_excluded"], 4)
+            self.assertEqual(
+                stats["speed_calibration"]["quantiles"],
+                {"slow": 0.2, "normal_low": 0.4, "normal_high": 0.6, "fast": 0.8},
+            )
+
     def test_candidates_approval_group_references_and_validation(self) -> None:
         """Exercise the no-audio control-data path, including normal-tag overlap."""
         with tempfile.TemporaryDirectory() as temporary:

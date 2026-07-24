@@ -32,6 +32,7 @@ import difflib
 import json
 import math
 import os
+import unicodedata
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -119,6 +120,18 @@ def parse_args() -> argparse.Namespace:
             "Skip records whose inferred source matches SOURCE; may be repeated. "
             "Useful for excluding BB03 from a mixed manifest before aligning the "
             "complete raw BB03 manifest separately."
+        ),
+    )
+    parser.add_argument(
+        "--cjk-only",
+        "--require-cjk-only",
+        dest="cjk_only",
+        action="store_true",
+        help=(
+            "Skip records before audio/model loading unless their cleaned text contains "
+            "at least one CJK character and otherwise contains only CJK characters, "
+            "punctuation, or whitespace. Useful with --language zh and a Chinese "
+            "CTC aligner on a mixed-language manifest."
         ),
     )
     parser.add_argument(
@@ -275,6 +288,26 @@ def _lexical_characters(clean_text: str) -> list[dict[str, str]]:
             if normalized:
                 items.append({"character": character, "normalized": normalized})
     return items
+
+
+def _is_cjk_only_clean_text(clean_text: str) -> bool:
+    """Return whether text is safe for a Chinese-only CTC alignment pass.
+
+    Chinese punctuation and whitespace do not change the spoken language, but
+    Latin letters, numbers, other scripts, symbols, and an empty/punctuation-
+    only transcript do.  This intentionally errs on the side of excluding a
+    record: callers use it only when they have selected ``--language zh`` and
+    a Chinese-only CTC model.
+    """
+    has_cjk = False
+    for character in clean_text:
+        if CJK_RE.fullmatch(character):
+            has_cjk = True
+            continue
+        if character.isspace() or unicodedata.category(character).startswith("P"):
+            continue
+        return False
+    return has_cjk
 
 
 def _base_row(
@@ -1233,6 +1266,7 @@ def main() -> None:
     alignment_counts: Counter[str] = Counter()
     scanned_records = 0
     excluded_source_records = 0
+    cjk_only_skipped_records = 0
     selected_records = 0
     written_records = 0
     with output_path.open("w", encoding="utf-8", newline="\n") as handle:
@@ -1243,6 +1277,11 @@ def main() -> None:
             scanned_records += 1
             if infer_source(record).lower() in excluded_sources:
                 excluded_source_records += 1
+                continue
+            if args.cjk_only and not _is_cjk_only_clean_text(
+                clean_spoken_text(record.get("text", ""))
+            ):
+                cjk_only_skipped_records += 1
                 continue
             if not _input_ordinal_in_shard(input_ordinal, args.shard_count, args.shard_index):
                 continue
@@ -1269,6 +1308,7 @@ def main() -> None:
     print(f"shard_index={args.shard_index}")
     print(f"scanned_records={scanned_records}")
     print(f"excluded_source_records={excluded_source_records}")
+    print(f"cjk_only_skipped_records={cjk_only_skipped_records}")
     print(f"selected_records={selected_records}")
     print(f"written_records={written_records}")
     print(f"status_counts={dict(sorted(counts.items()))}")
