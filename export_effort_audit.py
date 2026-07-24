@@ -15,7 +15,13 @@ from urllib.parse import quote
 
 import numpy as np
 
-from common import iter_jsonl, resolve_audio
+if __package__:
+    from .common import iter_jsonl, resolve_audio
+else:  # Direct execution must prefer this directory over a site-packages ``common``.
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from common import iter_jsonl, resolve_audio  # type: ignore[no-redef]
 
 
 def parse_args() -> argparse.Namespace:

@@ -22,10 +22,20 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-try:
+if __package__:
     from .common import EFFORT_TAGS, SPEED_TAGS, emotion_family, infer_source, iter_jsonl, resolve_audio
-except ImportError:  # pragma: no cover - direct CLI invocation.
-    from common import EFFORT_TAGS, SPEED_TAGS, emotion_family, infer_source, iter_jsonl, resolve_audio  # type: ignore
+else:  # Direct execution must prefer this directory over a site-packages ``common``.
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from common import (  # type: ignore[no-redef]
+        EFFORT_TAGS,
+        SPEED_TAGS,
+        emotion_family,
+        infer_source,
+        iter_jsonl,
+        resolve_audio,
+    )
 
 
 ALL_TAGS = frozenset((*SPEED_TAGS, *EFFORT_TAGS))
