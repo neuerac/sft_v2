@@ -220,6 +220,23 @@ def emotion_tags(text: Any) -> list[str]:
     return values
 
 
+def strip_emotion_tags(text: Any, tags: Iterable[str]) -> str:
+    """Remove only selected emotion tags while preserving spoken annotations.
+
+    This is deliberately narrower than ``clean_spoken_text``: bracketed
+    ``[breath]`` / ``[hold]`` markers remain because removing them would make
+    the SFT text disagree with the source audio.
+    """
+    targets = {str(tag).strip().lower() for tag in tags if str(tag).strip()}
+    if not targets:
+        return str(text or "").strip()
+
+    def replace(match: re.Match[str]) -> str:
+        return "" if match.group(1).strip().lower() in targets else match.group(0)
+
+    return EMOTION_RE.sub(replace, str(text or "")).strip()
+
+
 def emotion_family(text: Any) -> str:
     tags = emotion_tags(text)
     if not tags:
