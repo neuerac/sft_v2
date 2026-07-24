@@ -57,6 +57,20 @@ is `effort_strong`. It is not an absolute playback-volume label. The script
 also rejects recording groups without enough samples or enough active RMS/LUFS
 spread.
 
+Those effort values are the defaults, so they are intentionally omitted from
+the command above. To tighten effort to 5% / middle 5% / 5%, append these
+four arguments to the same build_control_candidates.py command:
+
+    --effort-soft-quantile 0.05 \
+    --effort-normal-low-quantile 0.475 \
+    --effort-normal-high-quantile 0.525 \
+    --effort-strong-quantile 0.95
+
+For a first effort review, the default P20 / P40-P60 / P80 policy is usually
+preferable. Effort classification requires agreement across several active
+loudness metrics inside each recording group, so a nominal 5% tail can yield
+far fewer usable files.
+
 ## 3. Copy BB03 audio into six folders
 
 The exporter accepts the candidate JSONL, not the alignment JSONL. It copies
@@ -68,11 +82,27 @@ manifest, an error list, and an export report.
   -m control_pipeline.export_bb03_control_library \
   --input-jsonl work/speed_effort_curation_v1/bb03_control_candidates.jsonl \
   --output-dir work/speed_effort_curation_v1/bb03_control_library \
-  --copy-mode copy
+  --copy-mode copy \
+  --per-tag 100
 ```
 
 Use a new output directory name on a rerun; the exporter refuses to overwrite
-an existing non-empty library.
+an existing non-empty library. It exports at most 100 examples per tag, prefixes
+the files with a stable rank, writes a sorted CSV manifest, and creates the
+index.html listener at the library root.
+
+The selection and display order are:
+
+- speed_slow: lowest CPS first.
+- speed_fast: highest CPS first.
+- speed_normal: 100 closest to the normal-category CPS median, displayed by CPS.
+- effort_soft and effort_strong: low/high within-recording-group relative
+  active LUFS first.
+- effort_normal: 100 closest to the normal-category relative-LUFS median,
+  displayed by relative LUFS.
+
+To listen, change into the exported library and run Python's HTTP server on
+port 8000. Open the server address followed by /index.html in a browser.
 
 ## 4. Review effort labels
 
