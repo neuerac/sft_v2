@@ -127,9 +127,14 @@ def _effort_relative_lufs(record: dict[str, Any]) -> tuple[float | None, str]:
 
 def _sort_value(record: dict[str, Any], tag: str) -> tuple[float | None, str]:
     if tag.startswith("speed_"):
+        # Candidates may have been classified with full-audio VAD CPS rather
+        # than the legacy pause-excluded rate. Preserve the classifier's
+        # selected metric when choosing the listening subset and its order.
+        value = _finite(_metric(record, "speed_rate_cps"))
+        if value is not None:
+            metric = str(_metric(record, "speed_rate_metric") or "speed_rate_cps")
+            return value, metric
         value = _finite(_metric(record, "pause_excluded_cps"))
-        if value is None:
-            value = _finite(_metric(record, "speed_rate_cps"))
         return value, "pause_excluded_cps"
     return _effort_relative_lufs(record)
 
@@ -242,7 +247,7 @@ def _write_listener_html(path: Path, rows: list[dict[str, Any]]) -> None:
                 f"<td>{html.escape(str(row['rank']))}</td>"
                 f"<td>{html.escape(str(row['sort_metric']))}</td>"
                 f"<td>{html.escape(_html_number(row['sort_value']))}</td>"
-                f"<td>{html.escape(_html_number(row.get('pause_excluded_cps')))}</td>"
+                f"<td>{html.escape(_html_number(row.get('speed_rate_cps')))}</td>"
                 f"<td>{html.escape(_html_number(row.get('active_lufs_p50')))}</td>"
                 f"<td><audio controls preload='none' src='{audio_path}'></audio></td>"
                 f"<td>{html.escape(str(row.get('text') or ''))}</td>"
@@ -252,7 +257,7 @@ def _write_listener_html(path: Path, rows: list[dict[str, Any]]) -> None:
         sections.append(
             f"<section id='{html.escape(tag)}'><h2>{html.escape(tag)} ({len(tag_rows)})</h2>"
             "<table><thead><tr><th>Rank</th><th>Sort metric</th><th>Sort value</th>"
-            "<th>Pause-excluded CPS</th><th>Active LUFS P50</th><th>Audio</th>"
+            "<th>Selected-rate CPS</th><th>Active LUFS P50</th><th>Audio</th>"
             "<th>Text</th></tr></thead><tbody>"
             + "".join(entries)
             + empty
@@ -414,9 +419,9 @@ def main() -> None:
         "copy_mode_requested": args.copy_mode,
         "materialization": dict(sorted(Counter(row["materialization"] for row in exported_rows).items())),
         "selection_policy": {
-            "speed_slow": "lowest pause_excluded_cps first",
-            "speed_normal": "closest to selected-category CPS median, then ascending CPS",
-            "speed_fast": "highest pause_excluded_cps first",
+            "speed_slow": "lowest selected speed-rate CPS first",
+            "speed_normal": "closest to selected-category speed-rate CPS median, then ascending",
+            "speed_fast": "highest selected speed-rate CPS first",
             "effort_soft": "lowest within-group relative active_lufs_p50 first",
             "effort_normal": "closest to selected-category relative active_lufs_p50 median, then ascending",
             "effort_strong": "highest within-group relative active_lufs_p50 first",
